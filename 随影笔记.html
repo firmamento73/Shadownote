@@ -658,11 +658,18 @@ $('#copyClean').onclick=async()=>{const ok=await copyToClip(buildPrompt(cleanPro
      B) 时间戳独占一行，正文在下一行 —— "发言人1 00:00:12"（通义听悟原始导出）
    旧版只认「整行短于 48 字」的时间戳行，导致 A 形态完全识别不出来：
    整篇被当成一块塞进一次请求，且原文切片全空、追问拿不到原文。 */
-var TS_HEAD=/^[\s\-–—•]*(?:[\[［(（【]\s*)?(\d{1,2}):([0-5]\d)(?::([0-5]\d))?\s*(?:[\]］)）】]|[-–—、,，]|\s|$)/;
+/* 行首时间戳；允许前面先有一个说话人标签（听悟/飞书妙记的单行导出就是这种），
+   这样判定就不再依赖行长度，长句子也能正确识别。 */
+var TS_HEAD=/^[\s\-–—•]*(?:(?:发言人|说话人|讲话人|主讲人|嘉宾|speaker)\s*[0-9A-Za-z]{0,4}\s*[：:]?\s*)?(?:[\[［(（【]\s*)?(\d{1,2}):([0-5]\d)(?::([0-5]\d))?\s*(?:[\]］)）】]|[-–—、,，]|\s|$)/;
+/* .srt / .vtt 的时间轴行：00:00:01,000 --> 00:00:04,000 —— 整行都是时间轴，正文在下一行 */
+var TS_CUE=/^\s*(\d{1,2}):([0-5]\d):([0-5]\d)[.,]\d{1,3}\s*-->\s*\d{1,2}:[0-5]\d:[0-5]\d[.,]\d{1,3}/;
 var TS_ANY=/(\d{1,2}):([0-5]\d)(?::([0-5]\d))?/;
-var TS_SPK=/^\s*(?:发言人|说话人|讲话人|主讲人|speaker)\s*[0-9A-Za-z]*\s*[：:]?\s*/i;
+var TS_SPK=/^\s*(?:发言人|说话人|讲话人|主讲人|嘉宾|speaker)\s*[0-9A-Za-z]{0,4}\s*[：:]?\s*/i;
+var TS_SEQ=/^\s*\d{1,5}\s*$/;          /* .srt 的序号行 */
 function tsLine(l){
   if(l==null)return null;
+  var cue=l.match(TS_CUE);
+  if(cue)return {sec:(+cue[1])*3600+(+cue[2])*60+(+cue[3]),rest:'',cue:true};
   var m=l.match(TS_HEAD),head=true;
   if(!m){ if(l.trim().length>=48)return null; m=l.match(TS_ANY); head=false; }
   if(!m)return null;
@@ -693,7 +700,11 @@ function chunkTranscript(text,maxChars){
   for(var c=0;c<chunks.length;c++){
     var ck=chunks[c];
     if(ck.length<=maxChars*1.5){safe.push(ck);continue;}
-    for(var p=0;p<ck.length;p+=maxChars)safe.push(ck.slice(p,p+maxChars));
+    for(var p=0;p<ck.length;){
+      var end=Math.min(ck.length,p+maxChars);
+      if(end<ck.length){var nl=ck.lastIndexOf('\n',end);if(nl>p+maxChars*0.5)end=nl+1;}
+      safe.push(ck.slice(p,end));p=end;
+    }
   }
   return safe.length?safe:[text];
 }
@@ -701,17 +712,24 @@ function parseTimed(text){
   var out=[],cur=null,lines=text.split(/\r?\n/);
   for(var i=0;i<lines.length;i++){
     var t=tsLine(lines[i]);
-    if(t){cur={sec:t.sec,text:t.rest||''};out.push(cur);}
-    else if(cur&&lines[i].trim()){cur.text+=(cur.text?'\n':'')+lines[i];}
+    if(t){cur={sec:t.sec,text:t.rest||''};out.push(cur);continue;}
+    if(!cur||!lines[i].trim())continue;
+    /* .srt 里每段前面有一行纯序号，别把它并进正文 */
+    if(TS_SEQ.test(lines[i])&&i+1<lines.length&&TS_CUE.test(lines[i+1]))continue;
+    if(/^\s*WEBVTT/i.test(lines[i]))continue;
+    cur.text+=(cur.text?'\n':'')+lines[i];
   }
   return out;
 }
 function buildNotesJson(notesTxt,transcriptText){const segs=parseNotes(notesTxt);const blocks=transcriptText?parseTimed(transcriptText):[];const out=segs.map((s,i)=>{const end=i+1<segs.length?segs[i+1].start:Infinity;let raw='';if(blocks.length)raw=blocks.filter(b=>b.sec>=s.start-0.001&&b.sec<end-0.001).map(b=>b.text).join('\n').trim();return{t:fmt(s.start),title:s.label,focus:s.focus,note:s.text,raw};});return{version:1,title:'',segments:out};}
 
+function abortErr(){var e=new Error('Aborted');e.name='AbortError';return e;}
 function sleepAbortable(ms,signal){
   return new Promise(function(res,rej){
-    var t=setTimeout(res,ms);
-    if(signal){signal.addEventListener('abort',function(){clearTimeout(t);var e=new Error('Aborted');e.name='AbortError';rej(e);},{once:true});}
+    if(signal&&signal.aborted)return rej(abortErr());
+    var onAbort=function(){clearTimeout(t);rej(abortErr());};
+    var t=setTimeout(function(){if(signal)signal.removeEventListener('abort',onAbort);res();},ms);
+    if(signal)signal.addEventListener('abort',onAbort,{once:true});
   });
 }
 function splitPoint(str){
@@ -724,7 +742,8 @@ async function llmOnce(prompt,chunk,signal,conf){
   if(!base||!key||!model)throw new Error('该步骤所选预设未填好 Base URL / Key / 模型。');
   var res=await fetch(base+'/chat/completions',{method:'POST',signal,headers:{'Content-Type':'application/json','Authorization':'Bearer '+key},body:JSON.stringify({model,temperature:0.3,messages:[{role:'user',content:prompt+chunk}]})});
   if(!res.ok){
-    var t=await res.text().catch(function(){return''});
+    var t='';
+    try{t=await res.text();}catch(e2){if(signal&&signal.aborted)throw abortErr();}
     var err=new Error('接口返回 '+res.status+'：'+t.slice(0,300));
     err.status=res.status;throw err;
   }
@@ -732,36 +751,46 @@ async function llmOnce(prompt,chunk,signal,conf){
   var ch=(data.choices&&data.choices[0])||{};
   return {text:((ch.message&&ch.message.content)||'').trim(),truncated:(ch.finish_reason==='length')};
 }
-/* 长逐字稿要发很多次请求，中途一次 429 / 500 / 断网就前功尽弃。
-   这里加了退避重试；模型因自身输出上限截断时（finish_reason==='length'）
-   自动把这块对半拆开重跑，而不是交出半截结果。 */
-async function callLLMgen(prompt,chunk,signal,conf,onNote){
-  var RETRIES=3,lastErr=null;
+/* 退避重试只包住「一次请求」。重试千万不能包住下面的拆块递归，
+   否则一个叶子失败会把整棵子树连同已成功的兄弟块整个重跑，
+   请求数按 8^深度 爆炸。 */
+async function llmWithRetry(prompt,chunk,signal,conf,onNote){
+  var RETRIES=3;
   for(var a=0;a<=RETRIES;a++){
+    if(signal&&signal.aborted)throw abortErr();
     try{
       var r=await llmOnce(prompt,chunk,signal,conf);
-      if(r.truncated&&chunk.length>1200){
-        if(onNote)onNote('输出被模型长度上限截断，自动拆成两半重跑…');
-        var mid=splitPoint(chunk);
-        var p1=await callLLMgen(prompt,chunk.slice(0,mid),signal,conf,onNote);
-        var p2=await callLLMgen(prompt,chunk.slice(mid),signal,conf,onNote);
-        return (p1+'\n\n'+p2).trim();
-      }
-      if(!r.text)throw new Error('模型返回了空内容。');
-      return r.text;
+      /* 空回复是最典型的偶发故障，必须可重试 */
+      if(!r.truncated&&!r.text){var em=new Error('模型返回了空内容。');em.retriable=true;throw em;}
+      return r;
     }catch(e){
       if(e&&e.name==='AbortError')throw e;
-      lastErr=e;
       var st=e&&e.status;
       var netErr=(st===undefined&&/Failed to fetch|NetworkError|load failed|ERR_/i.test((e&&e.message)||''));
-      var retriable=(st===408||st===409||st===429||(st>=500&&st<600)||netErr);
+      var retriable=(e&&e.retriable)||st===408||st===409||st===429||(st>=500&&st<600)||netErr;
       if(a===RETRIES||!retriable)throw e;
       var wait=Math.min(20000,1200*Math.pow(2,a));
       if(onNote)onNote('第 '+(a+1)+'/'+RETRIES+' 次重试（'+(st||'网络')+'），'+Math.round(wait/1000)+' 秒后继续…');
       await sleepAbortable(wait,signal);
     }
   }
-  throw lastErr;
+  throw new Error('重试已用尽。');
+}
+/* 模型因自身输出上限截断时（finish_reason==='length'）把这块对半拆开重跑，
+   而不是交出半截结果。深度设上限，避免病态输入下无限细分。 */
+var SPLIT_MAX_DEPTH=3;
+async function callLLMgen(prompt,chunk,signal,conf,onNote,depth){
+  depth=depth||0;
+  var r=await llmWithRetry(prompt,chunk,signal,conf,onNote);
+  if(r.truncated&&chunk.length>1200&&depth<SPLIT_MAX_DEPTH){
+    if(onNote)onNote('输出被模型长度上限截断，自动拆成两半重跑…');
+    var mid=splitPoint(chunk);
+    var p1=await callLLMgen(prompt,chunk.slice(0,mid),signal,conf,onNote,depth+1);
+    var p2=await callLLMgen(prompt,chunk.slice(mid),signal,conf,onNote,depth+1);
+    return (p1+'\n\n'+p2).trim();
+  }
+  if(!r.text)throw new Error('模型返回了空内容（已重试）。');
+  return r.text;
 }
 /* 生成完先自查一遍，把模型编时间戳、漏段、格式跑偏这类问题当场说出来 */
 function auditNotes(notesTxt,transcriptText){
@@ -791,7 +820,7 @@ var CLEAN_CHUNK=4000,GEN_CHUNK=8000;
 function withChunkNote(tmpl,i,n){
   if(n<=1)return tmpl;
   return '（这是整份逐字稿的第 '+(i+1)+'/'+n+' 部分。只处理你看到的这一部分：不要写开场白或总结，'
-    +'不要重复其它部分的内容，直接从本部分第一个时间戳开始输出。）\n\n'+tmpl;
+    +'不要重复其它部分的内容。开头若是半句话，把它并入本部分第一段一起处理，不要丢弃。）\n\n'+tmpl;
 }
 let genCtl=null,elapsedTimer=null,t0=0;
 const progWrap=$('#progWrap'),progFill=$('#progFill'),progStage=$('#progStage'),progElapsed=$('#progElapsed');
@@ -800,7 +829,7 @@ function tickElapsed(){progElapsed.textContent=fmt(Math.floor((Date.now()-t0)/10
 function startRun(){genCtl=new AbortController();$('#genBtn').disabled=true;const cr=$('#cleanRunBtn');if(cr)cr.disabled=true;progWrap.style.display='block';setProg(0,1);progStage.textContent='准备中…';t0=Date.now();tickElapsed();elapsedTimer=setInterval(tickElapsed,1000);genStatus.className='status';genStatus.textContent='';}
 function endRun(){$('#genBtn').disabled=false;const cr=$('#cleanRunBtn');if(cr)cr.disabled=false;clearInterval(elapsedTimer);}
 $('#stopBtn').onclick=()=>{if(genCtl)genCtl.abort();};
-let lastCleaned='';
+let lastCleaned='',lastGenSource='';
 $('#genBtn').onclick=async()=>{const tr=trText.value.trim();if(!tr){genStatus.className='status err';genStatus.textContent='请先导入或粘贴逐字稿。';return;}
   const cleaning=$('#enableClean').checked;
   const genConf=cfgOf(profileById(genProfileSel.value)||activeProfile());
@@ -812,9 +841,11 @@ $('#genBtn').onclick=async()=>{const tr=trText.value.trim();if(!tr){genStatus.cl
     if(cleaning){const tmpl=buildPrompt(cleanPromptTA.value);const parts0=[];for(let i=0;i<cleanChunks.length;i++){const lbl='清理 '+(i+1)+'/'+cleanChunks.length+' · '+cleanConf.model;progStage.textContent=lbl;const note=m=>{progStage.textContent=lbl+' · '+m;};parts0.push(await callLLMgen(withChunkNote(tmpl,i,cleanChunks.length),cleanChunks[i],genCtl.signal,cleanConf,note));done++;setProg(done,total);}work=parts0.join('\n');lastCleaned=work;const dc=$('#dlCleaned');if(dc)dc.disabled=false;}
     const genChunks=chunkTranscript(work,GEN_CHUNK);total=(cleaning?cleanChunks.length:0)+genChunks.length;setProg(done,total);const tmpl=buildPrompt(genPromptTA.value);outText.value='';updCount();
     for(let i=0;i<genChunks.length;i++){const lbl='生成 '+(i+1)+'/'+genChunks.length+' · '+genConf.model;progStage.textContent=lbl;const note=m=>{progStage.textContent=lbl+' · '+m;};const r=await callLLMgen(withChunkNote(tmpl,i,genChunks.length),genChunks[i],genCtl.signal,genConf,note);outText.value+=(outText.value?'\n\n':'')+r;updCount();outText.scrollTop=outText.scrollHeight;done++;setProg(done,total);}
-    progStage.textContent='完成';const issues=auditNotes(outText.value,work);const nSeg=parseNotes(outText.value).length;
+    progStage.textContent='完成';lastGenSource=work;const issues=auditNotes(outText.value,work);const nSeg=parseNotes(outText.value).length;
     if(issues.length){genStatus.className='status err';genStatus.textContent='生成完成，但自检发现问题：\n· '+issues.join('\n· ')+'\n可以补一下「主题」、调整提示词后重跑，或直接在下方手动修正。';}
-    else{genStatus.className='status ok';genStatus.textContent='生成完成 ✓ 共 '+nSeg+' 段。「在查看器中加载」会自动配上原文供问答。'+(cleaning?' 清理后的逐字稿可点上方「下载上次清理结果」获取。':'');}
+    else{const withRaw=buildNotesJson(outText.value,work).segments.filter(x=>(x.raw||'').trim()).length;
+      if(nSeg&&!withRaw){genStatus.className='status err';genStatus.textContent='生成完成，共 '+nSeg+' 段——但没能从逐字稿里切出任何原文，导出的 .json 里 raw 会是空的，追问将没有上下文可用。请检查逐字稿是不是每段都以时间戳开头。';}
+      else{genStatus.className='status ok';genStatus.textContent='生成完成 ✓ 共 '+nSeg+' 段（'+withRaw+' 段已配上原文）。'+(cleaning?' 清理后的逐字稿可点上方「下载上次清理结果」获取。':'');}}
   }catch(e){if(e&&e.name==='AbortError'){genStatus.className='status';genStatus.textContent='已停止。已生成的部分保留在下方。';progStage.textContent='已停止';}else{genStatus.className='status err';genStatus.textContent='生成失败：'+describeErr(e);progStage.textContent='出错';}}finally{endRun();}
 };
 async function runCleanOnly(download){const tr=trText.value.trim();if(!tr){genStatus.className='status err';genStatus.textContent='请先导入或粘贴逐字稿。';return;}
@@ -830,9 +861,9 @@ async function runCleanOnly(download){const tr=trText.value.trim();if(!tr){genSt
 $('#cleanRunBtn').onclick=()=>runCleanOnly(true);
 $('#dlCleaned').onclick=()=>{if(!lastCleaned){genStatus.className='status err';genStatus.textContent='还没有清理结果。先点「仅清理并下载逐字稿」，或勾选清理后一键生成。';return;}downloadText('逐字稿-已清理.txt',lastCleaned);};
 $('#downloadOut').onclick=()=>downloadText('notes.txt',outText.value);
-$('#downloadJson').onclick=()=>{if(!outText.value.trim()){genStatus.className='status err';genStatus.textContent='还没有可导出的笔记。';return;}downloadText('notes.json',JSON.stringify(buildNotesJson(outText.value,trText.value),null,2),'application/json');};
+$('#downloadJson').onclick=()=>{if(!outText.value.trim()){genStatus.className='status err';genStatus.textContent='还没有可导出的笔记。';return;}downloadText('notes.json',JSON.stringify(buildNotesJson(outText.value,lastGenSource||trText.value),null,2),'application/json');};
 $('#copyOut').onclick=async()=>{const ok=await copyToClip(outText.value);genStatus.className='status'+(ok?' ok':' err');genStatus.textContent=ok?'已复制输出。':'复制失败。';};
-$('#loadIntoViewer').onclick=()=>{if(!outText.value.trim()){genStatus.className='status err';genStatus.textContent='还没有可加载的笔记。';return;}loadNotesJson(buildNotesJson(outText.value,trText.value));statusHint.textContent='已从工作台加载（追问模式）· 载入视频即可同步';showWorkbench(false);};
+$('#loadIntoViewer').onclick=()=>{if(!outText.value.trim()){genStatus.className='status err';genStatus.textContent='还没有可加载的笔记。';return;}loadNotesJson(buildNotesJson(outText.value,lastGenSource||trText.value));statusHint.textContent='已从工作台加载（追问模式）· 载入视频即可同步';showWorkbench(false);};
 
 /* ===================== Q&A panel ===================== */
 const qaPanel=$('#qaPanel'),qaConv=$('#qaConv'),qaFollow=$('#qaFollow'),qaReopen=$('#qaReopen'),qaThreadsEl=$('#qaThreads'),qaCtxEl=$('#qaCtx');
