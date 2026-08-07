@@ -399,7 +399,7 @@ const DEFAULT_NOTES = `# 示例笔记，载入你自己的文件后会被替换
 逐字稿：接下来现场演示一遍完整流程，你可以暂停跟着做。`;
 
 const DEFAULT_CLEAN_PROMPT = `你将看到一份语音转写（ASR）的逐字稿，主题是：{{主题}}。
-转写的【时间轴是准确的】，但【英文术语经常被听错】。请你：
+转写的【时间轴是准确的】，但【术语可能经常被听错】，并且还有很多语音识别错误。请你结合语境和上下文修改：
 1. 逐句改正明显的领域识别错误（按上下文判断，把听错的专业术语还原成正确英文）。
 2. 去掉"嗯/那个/就是说"等口水词与明显重复，使句子通顺；但不要改动原意、不要增删信息点。
 3. 时间戳一律原样保留，绝不改动、绝不把跨时间戳的内容合并。
@@ -652,11 +652,147 @@ async function copyToClip(t){try{await navigator.clipboard.writeText(t);return t
 $('#copyGen').onclick=async()=>{const ok=await copyToClip(buildPrompt(genPromptTA.value));genStatus.className='status'+(ok?' ok':' err');genStatus.textContent=ok?'已复制「生成 Prompt」，把逐字稿贴在末尾即可。':'复制失败，请手动选中。';};
 $('#copyClean').onclick=async()=>{const ok=await copyToClip(buildPrompt(cleanPromptTA.value));genStatus.className='status'+(ok?' ok':' err');genStatus.textContent=ok?'已复制「清理 Prompt」，把逐字稿贴在末尾即可。':'复制失败，请手动选中。';};
 
-function chunkTranscript(text,maxChars=11000){const lines=text.split(/\r?\n/);const groups=[];let cur=[];const isTs=l=>/\d{1,2}:\d{2}(?::\d{2})?/.test(l)&&l.trim().length<48;for(const l of lines){if(cur.length&&isTs(l)){groups.push(cur.join('\n'));cur=[l];}else cur.push(l);}if(cur.length)groups.push(cur.join('\n'));const chunks=[];let buf='';for(const g of groups){if(buf&&(buf.length+g.length)>maxChars){chunks.push(buf);buf=g;}else buf=buf?buf+'\n'+g:g;}if(buf)chunks.push(buf);return chunks.length?chunks:[text];}
-function parseTimed(text){const lines=text.split(/\r?\n/);const out=[];let cur=null;const tsRe=/(\d{1,2}):(\d{2})(?::(\d{2}))?/;const isTs=l=>tsRe.test(l)&&l.trim().length<48;for(const l of lines){if(isTs(l)){const m=l.match(tsRe);const sec=m[3]?(+m[1])*3600+(+m[2])*60+(+m[3]):(+m[1])*60+(+m[2]);cur={sec,text:''};out.push(cur);}else if(cur){cur.text+=(cur.text?'\n':'')+l;}}return out;}
+/* ---- 时间戳行识别（切块与原文对齐共用同一套判定，避免两边判断不一致）----
+   支持两种常见形态：
+     A) 行首时间戳，正文同行 —— "[00:12] 正文…" / "00:12 正文…"（清理后的逐字稿就是这种）
+     B) 时间戳独占一行，正文在下一行 —— "发言人1 00:00:12"（通义听悟原始导出）
+   旧版只认「整行短于 48 字」的时间戳行，导致 A 形态完全识别不出来：
+   整篇被当成一块塞进一次请求，且原文切片全空、追问拿不到原文。 */
+var TS_HEAD=/^[\s\-–—•]*(?:[\[［(（【]\s*)?(\d{1,2}):([0-5]\d)(?::([0-5]\d))?\s*(?:[\]］)）】]|[-–—、,，]|\s|$)/;
+var TS_ANY=/(\d{1,2}):([0-5]\d)(?::([0-5]\d))?/;
+var TS_SPK=/^\s*(?:发言人|说话人|讲话人|主讲人|speaker)\s*[0-9A-Za-z]*\s*[：:]?\s*/i;
+function tsLine(l){
+  if(l==null)return null;
+  var m=l.match(TS_HEAD),head=true;
+  if(!m){ if(l.trim().length>=48)return null; m=l.match(TS_ANY); head=false; }
+  if(!m)return null;
+  var sec=m[3]?(+m[1])*3600+(+m[2])*60+(+m[3]):(+m[1])*60+(+m[2]);
+  var rest;
+  if(head){rest=l.slice(m[0].length);}
+  else{var i=l.indexOf(m[0]);rest=l.slice(0,i)+' '+l.slice(i+m[0].length);}
+  rest=rest.replace(TS_SPK,'').trim();
+  return {sec:sec,rest:rest};
+}
+function chunkTranscript(text,maxChars){
+  maxChars=maxChars||8000;
+  var lines=text.split(/\r?\n/),groups=[],cur=[];
+  for(var i=0;i<lines.length;i++){
+    if(cur.length&&tsLine(lines[i])){groups.push(cur.join('\n'));cur=[lines[i]];}
+    else cur.push(lines[i]);
+  }
+  if(cur.length)groups.push(cur.join('\n'));
+  var chunks=[],buf='';
+  for(var g=0;g<groups.length;g++){
+    var gg=groups[g];
+    if(buf&&(buf.length+gg.length)>maxChars){chunks.push(buf);buf=gg;}
+    else buf=buf?buf+'\n'+gg:gg;
+  }
+  if(buf)chunks.push(buf);
+  /* 兜底：万一整篇都认不出时间戳，也按字符硬切，绝不把整篇塞进一次请求 */
+  var safe=[];
+  for(var c=0;c<chunks.length;c++){
+    var ck=chunks[c];
+    if(ck.length<=maxChars*1.5){safe.push(ck);continue;}
+    for(var p=0;p<ck.length;p+=maxChars)safe.push(ck.slice(p,p+maxChars));
+  }
+  return safe.length?safe:[text];
+}
+function parseTimed(text){
+  var out=[],cur=null,lines=text.split(/\r?\n/);
+  for(var i=0;i<lines.length;i++){
+    var t=tsLine(lines[i]);
+    if(t){cur={sec:t.sec,text:t.rest||''};out.push(cur);}
+    else if(cur&&lines[i].trim()){cur.text+=(cur.text?'\n':'')+lines[i];}
+  }
+  return out;
+}
 function buildNotesJson(notesTxt,transcriptText){const segs=parseNotes(notesTxt);const blocks=transcriptText?parseTimed(transcriptText):[];const out=segs.map((s,i)=>{const end=i+1<segs.length?segs[i+1].start:Infinity;let raw='';if(blocks.length)raw=blocks.filter(b=>b.sec>=s.start-0.001&&b.sec<end-0.001).map(b=>b.text).join('\n').trim();return{t:fmt(s.start),title:s.label,focus:s.focus,note:s.text,raw};});return{version:1,title:'',segments:out};}
 
-async function callLLMgen(prompt,chunk,signal,conf){const c=conf||cfg();const base=(c.base||'').replace(/\/+$/,''),key=(c.key||'').trim(),model=(c.model||'').trim();if(!base||!key||!model)throw new Error('该步骤所选预设未填好 Base URL / Key / 模型。');const res=await fetch(base+'/chat/completions',{method:'POST',signal,headers:{'Content-Type':'application/json','Authorization':'Bearer '+key},body:JSON.stringify({model,temperature:0.3,messages:[{role:'user',content:prompt+chunk}]})});if(!res.ok){const t=await res.text().catch(()=>'');throw new Error('接口返回 '+res.status+'：'+t.slice(0,300));}const data=await res.json();return (data.choices&&data.choices[0]&&data.choices[0].message&&data.choices[0].message.content||'').trim();}
+function sleepAbortable(ms,signal){
+  return new Promise(function(res,rej){
+    var t=setTimeout(res,ms);
+    if(signal){signal.addEventListener('abort',function(){clearTimeout(t);var e=new Error('Aborted');e.name='AbortError';rej(e);},{once:true});}
+  });
+}
+function splitPoint(str){
+  var half=Math.floor(str.length/2),nl=str.lastIndexOf('\n',half);
+  return nl>str.length*0.2?nl+1:half;
+}
+async function llmOnce(prompt,chunk,signal,conf){
+  var c=conf||cfg();
+  var base=(c.base||'').replace(/\/+$/,''),key=(c.key||'').trim(),model=(c.model||'').trim();
+  if(!base||!key||!model)throw new Error('该步骤所选预设未填好 Base URL / Key / 模型。');
+  var res=await fetch(base+'/chat/completions',{method:'POST',signal,headers:{'Content-Type':'application/json','Authorization':'Bearer '+key},body:JSON.stringify({model,temperature:0.3,messages:[{role:'user',content:prompt+chunk}]})});
+  if(!res.ok){
+    var t=await res.text().catch(function(){return''});
+    var err=new Error('接口返回 '+res.status+'：'+t.slice(0,300));
+    err.status=res.status;throw err;
+  }
+  var data=await res.json();
+  var ch=(data.choices&&data.choices[0])||{};
+  return {text:((ch.message&&ch.message.content)||'').trim(),truncated:(ch.finish_reason==='length')};
+}
+/* 长逐字稿要发很多次请求，中途一次 429 / 500 / 断网就前功尽弃。
+   这里加了退避重试；模型因自身输出上限截断时（finish_reason==='length'）
+   自动把这块对半拆开重跑，而不是交出半截结果。 */
+async function callLLMgen(prompt,chunk,signal,conf,onNote){
+  var RETRIES=3,lastErr=null;
+  for(var a=0;a<=RETRIES;a++){
+    try{
+      var r=await llmOnce(prompt,chunk,signal,conf);
+      if(r.truncated&&chunk.length>1200){
+        if(onNote)onNote('输出被模型长度上限截断，自动拆成两半重跑…');
+        var mid=splitPoint(chunk);
+        var p1=await callLLMgen(prompt,chunk.slice(0,mid),signal,conf,onNote);
+        var p2=await callLLMgen(prompt,chunk.slice(mid),signal,conf,onNote);
+        return (p1+'\n\n'+p2).trim();
+      }
+      if(!r.text)throw new Error('模型返回了空内容。');
+      return r.text;
+    }catch(e){
+      if(e&&e.name==='AbortError')throw e;
+      lastErr=e;
+      var st=e&&e.status;
+      var netErr=(st===undefined&&/Failed to fetch|NetworkError|load failed|ERR_/i.test((e&&e.message)||''));
+      var retriable=(st===408||st===409||st===429||(st>=500&&st<600)||netErr);
+      if(a===RETRIES||!retriable)throw e;
+      var wait=Math.min(20000,1200*Math.pow(2,a));
+      if(onNote)onNote('第 '+(a+1)+'/'+RETRIES+' 次重试（'+(st||'网络')+'），'+Math.round(wait/1000)+' 秒后继续…');
+      await sleepAbortable(wait,signal);
+    }
+  }
+  throw lastErr;
+}
+/* 生成完先自查一遍，把模型编时间戳、漏段、格式跑偏这类问题当场说出来 */
+function auditNotes(notesTxt,transcriptText){
+  var issues=[],segs=parseNotes(notesTxt||'');
+  if(!segs.length){issues.push('没有解析出任何段落——模型多半没按 [mm:ss] 开头的格式输出。');return issues;}
+  var blocks=transcriptText?parseTimed(transcriptText):[];
+  if(blocks.length){
+    var secs=blocks.map(function(b){return b.sec;});
+    var maxT=Math.max.apply(null,secs),bad=0;
+    segs.forEach(function(sg){
+      var hit=secs.some(function(v){return Math.abs(v-sg.start)<=3;});
+      if(!hit)bad++;
+    });
+    if(bad>segs.length*0.3)issues.push('有 '+bad+'/'+segs.length+' 段的时间戳在逐字稿里找不到对应位置，模型可能自己编了时间戳。');
+    var over=segs.filter(function(sg){return sg.start>maxT+5;}).length;
+    if(over)issues.push('有 '+over+' 段的时间戳超出了逐字稿总时长。');
+  }
+  var dup=segs.length-(new Set(segs.map(function(sg){return sg.start;}))).size;
+  if(dup>0)issues.push('有 '+dup+' 段时间戳重复。');
+  return issues;
+}
+/* 清理是「改写」，输出长度≈输入长度，块必须小；生成是「压缩」，可以大一些。
+   都远低于常见 4096 token 的默认输出上限，避免被静默截断。 */
+var CLEAN_CHUNK=4000,GEN_CHUNK=8000;
+/* 分块时告诉模型它只看到了一部分，免得每块都写一遍开场白 / 总结。
+   加在最前面，不动用户自己编辑的提示词正文。 */
+function withChunkNote(tmpl,i,n){
+  if(n<=1)return tmpl;
+  return '（这是整份逐字稿的第 '+(i+1)+'/'+n+' 部分。只处理你看到的这一部分：不要写开场白或总结，'
+    +'不要重复其它部分的内容，直接从本部分第一个时间戳开始输出。）\n\n'+tmpl;
+}
 let genCtl=null,elapsedTimer=null,t0=0;
 const progWrap=$('#progWrap'),progFill=$('#progFill'),progStage=$('#progStage'),progElapsed=$('#progElapsed');
 function setProg(done,total){progFill.style.width=(total?Math.min(100,done/total*100):0)+'%';}
@@ -672,18 +808,20 @@ $('#genBtn').onclick=async()=>{const tr=trText.value.trim();if(!tr){genStatus.cl
   let cleanConf=genConf;
   if(cleaning){cleanConf=cfgOf(profileById(cleanProfileSel.value)||activeProfile());if(!cleanConf.base||!cleanConf.key||!cleanConf.model){genStatus.className='status err';genStatus.textContent='已勾选清理，但「清理用预设」未填好 Base URL / Key / 模型。';return;}}
   startRun();let done=0;
-  try{const cleanChunks=cleaning?chunkTranscript(tr):[];let total=cleanChunks.length+chunkTranscript(tr).length;setProg(0,total);let work=tr;
-    if(cleaning){const tmpl=buildPrompt(cleanPromptTA.value);const parts0=[];for(let i=0;i<cleanChunks.length;i++){progStage.textContent='清理 '+(i+1)+'/'+cleanChunks.length+' · '+cleanConf.model;parts0.push(await callLLMgen(tmpl,cleanChunks[i],genCtl.signal,cleanConf));done++;setProg(done,total);}work=parts0.join('\n');lastCleaned=work;const dc=$('#dlCleaned');if(dc)dc.disabled=false;}
-    const genChunks=chunkTranscript(work);total=(cleaning?cleanChunks.length:0)+genChunks.length;setProg(done,total);const tmpl=buildPrompt(genPromptTA.value);outText.value='';updCount();
-    for(let i=0;i<genChunks.length;i++){progStage.textContent='生成 '+(i+1)+'/'+genChunks.length+' · '+genConf.model;const r=await callLLMgen(tmpl,genChunks[i],genCtl.signal,genConf);outText.value+=(outText.value?'\n\n':'')+r;updCount();outText.scrollTop=outText.scrollHeight;done++;setProg(done,total);}
-    progStage.textContent='完成';genStatus.className='status ok';genStatus.textContent='生成完成 ✓ 「在查看器中加载」会自动配上原文供问答。'+(cleaning?' 清理后的逐字稿可点上方「下载上次清理结果」获取。':'');
+  try{const cleanChunks=cleaning?chunkTranscript(tr,CLEAN_CHUNK):[];let total=cleanChunks.length+chunkTranscript(tr,GEN_CHUNK).length;setProg(0,total);let work=tr;
+    if(cleaning){const tmpl=buildPrompt(cleanPromptTA.value);const parts0=[];for(let i=0;i<cleanChunks.length;i++){const lbl='清理 '+(i+1)+'/'+cleanChunks.length+' · '+cleanConf.model;progStage.textContent=lbl;const note=m=>{progStage.textContent=lbl+' · '+m;};parts0.push(await callLLMgen(withChunkNote(tmpl,i,cleanChunks.length),cleanChunks[i],genCtl.signal,cleanConf,note));done++;setProg(done,total);}work=parts0.join('\n');lastCleaned=work;const dc=$('#dlCleaned');if(dc)dc.disabled=false;}
+    const genChunks=chunkTranscript(work,GEN_CHUNK);total=(cleaning?cleanChunks.length:0)+genChunks.length;setProg(done,total);const tmpl=buildPrompt(genPromptTA.value);outText.value='';updCount();
+    for(let i=0;i<genChunks.length;i++){const lbl='生成 '+(i+1)+'/'+genChunks.length+' · '+genConf.model;progStage.textContent=lbl;const note=m=>{progStage.textContent=lbl+' · '+m;};const r=await callLLMgen(withChunkNote(tmpl,i,genChunks.length),genChunks[i],genCtl.signal,genConf,note);outText.value+=(outText.value?'\n\n':'')+r;updCount();outText.scrollTop=outText.scrollHeight;done++;setProg(done,total);}
+    progStage.textContent='完成';const issues=auditNotes(outText.value,work);const nSeg=parseNotes(outText.value).length;
+    if(issues.length){genStatus.className='status err';genStatus.textContent='生成完成，但自检发现问题：\n· '+issues.join('\n· ')+'\n可以补一下「主题」、调整提示词后重跑，或直接在下方手动修正。';}
+    else{genStatus.className='status ok';genStatus.textContent='生成完成 ✓ 共 '+nSeg+' 段。「在查看器中加载」会自动配上原文供问答。'+(cleaning?' 清理后的逐字稿可点上方「下载上次清理结果」获取。':'');}
   }catch(e){if(e&&e.name==='AbortError'){genStatus.className='status';genStatus.textContent='已停止。已生成的部分保留在下方。';progStage.textContent='已停止';}else{genStatus.className='status err';genStatus.textContent='生成失败：'+describeErr(e);progStage.textContent='出错';}}finally{endRun();}
 };
 async function runCleanOnly(download){const tr=trText.value.trim();if(!tr){genStatus.className='status err';genStatus.textContent='请先导入或粘贴逐字稿。';return;}
   const conf=cfgOf(profileById(cleanProfileSel.value)||activeProfile());
   if(!conf.base||!conf.key||!conf.model){genStatus.className='status err';genStatus.textContent='「清理用预设」未填好 Base URL / Key / 模型。';return;}
   startRun();let done=0;
-  try{const chunks=chunkTranscript(tr);setProg(0,chunks.length);const tmpl=buildPrompt(cleanPromptTA.value);const parts=[];for(let i=0;i<chunks.length;i++){progStage.textContent='清理 '+(i+1)+'/'+chunks.length+' · '+conf.model;parts.push(await callLLMgen(tmpl,chunks[i],genCtl.signal,conf));done++;setProg(done,chunks.length);}
+  try{const chunks=chunkTranscript(tr,CLEAN_CHUNK);setProg(0,chunks.length);const tmpl=buildPrompt(cleanPromptTA.value);const parts=[];for(let i=0;i<chunks.length;i++){const lbl='清理 '+(i+1)+'/'+chunks.length+' · '+conf.model;progStage.textContent=lbl;const note=m=>{progStage.textContent=lbl+' · '+m;};parts.push(await callLLMgen(withChunkNote(tmpl,i,chunks.length),chunks[i],genCtl.signal,conf,note));done++;setProg(done,chunks.length);}
     lastCleaned=parts.join('\n');const dc=$('#dlCleaned');if(dc)dc.disabled=false;
     if(download)downloadText('逐字稿-已清理.txt',lastCleaned);
     progStage.textContent='完成';genStatus.className='status ok';genStatus.textContent='清理完成 ✓'+(download?' 已下载「逐字稿-已清理.txt」。':' 可点「下载上次清理结果」。');
